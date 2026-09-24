@@ -1,23 +1,27 @@
 """Outils métier pour l'agent de support d'événement.
 
-Ces outils ne dépendent d'aucune API externe : les inscriptions et le
-programme de l'événement sont gérés dans un petit fichier JSON local
-(voir settings_yp.EVENT_STORE_FILE), ce qui suffit pour la démonstration
+Ces outils ne dépendent d'aucune API externe : les inscriptions sont gérées
+dans une petite base SQLite locale (voir settings_yp.EVENT_DB_FILE) et le
+programme de l'événement est statique, ce qui suffit pour la démonstration
 et permet de tester l'agent hors-ligne.
 """
 
-import json
 import re
-import threading
-from datetime import datetime, timezone
 
 from langchain_core.tools import tool
 
-import settings_yp
-
-_LOCK = threading.Lock()
+import database
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _invalid_email(email: str) -> dict:
+    return {"status": "error", "message": f"L'adresse email '{email}' semble invalide."}
+
+
+def _not_registered(email: str) -> dict:
+    return {"status": "not_found", "message": f"Aucune inscription trouvée pour {email}."}
+
 
 # Programme fixe de l'événement (données métier statiques).
 EVENT_SESSIONS = {
@@ -56,18 +60,6 @@ EVENT_FAQ = {
 }
 
 
-def _load_store() -> dict:
-    if not settings_yp.EVENT_STORE_FILE.exists():
-        return {"participants": {}}
-    with open(settings_yp.EVENT_STORE_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _save_store(store: dict) -> None:
-    with open(settings_yp.EVENT_STORE_FILE, "w", encoding="utf-8") as f:
-        json.dump(store, f, ensure_ascii=False, indent=2)
-
-
 @tool
 def register_participant(name: str, email: str, sessions: list[str] | None = None) -> dict:
     """Inscrit un participant à l'événement, et éventuellement à des sessions précises.
@@ -80,7 +72,7 @@ def register_participant(name: str, email: str, sessions: list[str] | None = Non
     """
     email = email.strip().lower()
     if not EMAIL_RE.match(email):
-        return {"status": "error", "message": f"L'adresse email '{email}' semble invalide."}
+        return _invalid_email(email)
 
     sessions = sessions or []
     unknown = [s for s in sessions if s not in EVENT_SESSIONS]
@@ -91,27 +83,14 @@ def register_participant(name: str, email: str, sessions: list[str] | None = Non
             "Utilisez list_event_sessions pour voir les sessions disponibles.",
         }
 
-    with _LOCK:
-        store = _load_store()
-        for session_id in sessions:
-            registered_count = sum(
-                1
-                for p in store["participants"].values()
-                if session_id in p.get("sessions", []) and p["email"] != email
-            )
-            if registered_count >= EVENT_SESSIONS[session_id]["capacity"]:
-                return {
-                    "status": "error",
-                    "message": f"La session '{EVENT_SESSIONS[session_id]['title']}' est complète.",
-                }
-
-        store["participants"][email] = {
-            "name": name,
-            "email": email,
-            "sessions": sessions,
-            "registered_at": datetime.now(timezone.utc).isoformat(),
+    capacities = {session_id: s["capacity"] for session_id, s in EVENT_SESSIONS.items()}
+    try:
+        database.upsert_participant(email, name, sessions, capacities)
+    except database.SessionFullError as e:
+        return {
+            "status": "error",
+            "message": f"La session '{EVENT_SESSIONS[e.session_id]['title']}' est complète.",
         }
-        _save_store(store)
 
     return {
         "status": "ok",
@@ -121,14 +100,39 @@ def register_participant(name: str, email: str, sessions: list[str] | None = Non
 
 
 @tool
+def check_registration(email: str) -> dict:
+    """Vérifie si un participant est déjà inscrit à l'événement, à partir de son email.
+
+    À utiliser avant d'inscrire quelqu'un (register_participant), pour éviter les
+    doublons, ou pour répondre simplement à une question du type "suis-je déjà
+    inscrit ?".
+
+    Args:
+        email: Adresse email du participant à vérifier.
+    """
+    email = email.strip().lower()
+    if not EMAIL_RE.match(email):
+        return _invalid_email(email)
+
+    participant = database.get_participant(email)
+    if participant is None:
+        return {"status": "ok", "registered": False, "message": f"Aucune inscription trouvée pour {email}."}
+    return {
+        "status": "ok",
+        "registered": True,
+        "name": participant["name"],
+        "registered_at": participant["registered_at"],
+        "message": f"{participant['name']} ({email}) est déjà inscrit·e.",
+    }
+
+
+@tool
 def get_registration(email: str) -> dict:
     """Récupère les informations d'inscription d'un participant à partir de son email."""
     email = email.strip().lower()
-    with _LOCK:
-        store = _load_store()
-    participant = store["participants"].get(email)
+    participant = database.get_participant(email)
     if participant is None:
-        return {"status": "not_found", "message": f"Aucune inscription trouvée pour {email}."}
+        return _not_registered(email)
     return {"status": "ok", "participant": participant}
 
 
@@ -136,12 +140,8 @@ def get_registration(email: str) -> dict:
 def cancel_registration(email: str) -> dict:
     """Annule l'inscription d'un participant à partir de son email."""
     email = email.strip().lower()
-    with _LOCK:
-        store = _load_store()
-        if email not in store["participants"]:
-            return {"status": "not_found", "message": f"Aucune inscription trouvée pour {email}."}
-        del store["participants"][email]
-        _save_store(store)
+    if not database.delete_participant(email):
+        return _not_registered(email)
     return {"status": "ok", "message": f"Inscription de {email} annulée."}
 
 
@@ -160,10 +160,8 @@ def check_session_availability(session_id: str) -> dict:
     """
     if session_id not in EVENT_SESSIONS:
         return {"status": "error", "message": f"Session inconnue : {session_id}."}
-    with _LOCK:
-        store = _load_store()
+    taken = database.count_session_registrations(session_id)
     session = EVENT_SESSIONS[session_id]
-    taken = sum(1 for p in store["participants"].values() if session_id in p.get("sessions", []))
     return {
         "status": "ok",
         "session": session["title"],
@@ -204,6 +202,7 @@ def multiply(a: float, b: float) -> float:
 
 BUSINESS_TOOLS = [
     register_participant,
+    check_registration,
     get_registration,
     cancel_registration,
     list_event_sessions,

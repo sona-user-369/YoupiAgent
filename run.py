@@ -5,9 +5,9 @@ l'interface Streamlit dans app_streamlit.py).
 
 import asyncio
 import uuid
-from typing import List, Optional, Tuple
+from typing import Optional
 
-from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.messages import HumanMessage
 
 from main import State, YoupiAgent
 
@@ -24,44 +24,40 @@ def get_graph():
     return _graph
 
 
-async def chat(
-    user_input: str,
-    history: List[BaseMessage],
-    user_id: str,
-    session_id: str,
-) -> Tuple[str, List[BaseMessage]]:
+async def chat(user_input: str, user_id: str, session_id: str) -> str:
     """Envoie un message utilisateur à l'agent.
+
+    On ne passe jamais l'historique brut de la conversation à l'agent : le
+    contexte court-terme (dernier échange) et long-terme (faits Mem0) sont
+    gérés en interne par MemoryStore, indexés sur session_id / user_id.
 
     Args:
         user_input: le texte tapé par l'utilisateur.
-        history: l'historique des messages LangChain déjà échangés dans la session.
         user_id: identifiant stable du participant (sert de clé pour la mémoire long-terme).
         session_id: identifiant de la conversation en cours.
 
     Returns:
-        Un tuple (réponse texte de l'agent, historique complet mis à jour).
+        La réponse texte de l'agent.
     """
     graph = get_graph()
     state = State(
-        messages=history + [HumanMessage(content=user_input)],
+        messages=[HumanMessage(content=user_input)],
         user_id=user_id,
         session_id=session_id,
     )
     result = await graph.ainvoke(state)
-    updated_history = result["messages"]
 
     reply = next(
-        (m.content for m in reversed(updated_history) if m.type == "ai" and m.content),
+        (m.content for m in reversed(result["messages"]) if m.type == "ai" and m.content),
         "",
     )
-    return reply, updated_history
+    return reply
 
 
 async def _cli_main():
     print("YoupiAgent - assistant de support d'événement (tapez 'exit' pour quitter)")
     user_id = input("Votre email (identifiant participant) : ").strip() or "anonymous"
     session_id = str(uuid.uuid4())
-    history: List[BaseMessage] = []
 
     while True:
         try:
@@ -73,7 +69,7 @@ async def _cli_main():
         if not user_input:
             continue
 
-        reply, history = await chat(user_input, history, user_id, session_id)
+        reply = await chat(user_input, user_id, session_id)
         print(f"Agent > {reply}")
 
 

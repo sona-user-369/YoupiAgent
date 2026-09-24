@@ -7,14 +7,10 @@ import asyncio
 import uuid
 
 import streamlit as st
-from langchain_core.messages import AIMessage, HumanMessage
 
-from run import chat
+from memory import get_memory_store
 
 st.set_page_config(page_title="YoupiAgent - Support événement", page_icon="🎫")
-
-st.title("🎫 YoupiAgent")
-st.caption("Assistant de support client pour votre événement — inscriptions, programme et infos pratiques.")
 
 if "session_id" not in st.session_state:
     st.session_state.session_id = str(uuid.uuid4())
@@ -22,6 +18,13 @@ if "history" not in st.session_state:
     st.session_state.history = []
 if "user_id" not in st.session_state:
     st.session_state.user_id = ""
+if "event_loop" not in st.session_state:
+    # Le client RodiumAI est async-only et garde ses connexions HTTP ouvertes
+    # sur la boucle asyncio qui les a créées. Streamlit ré-exécute ce script
+    # à chaque interaction : `asyncio.run()` créerait et fermerait une
+    # nouvelle boucle à chaque fois, cassant ces connexions ("Event loop is
+    # closed"). On garde donc une seule boucle vivante pour toute la session.
+    st.session_state.event_loop = asyncio.new_event_loop()
 
 with st.sidebar:
     st.subheader("Votre identité")
@@ -40,33 +43,29 @@ with st.sidebar:
         st.session_state.session_id = str(uuid.uuid4())
         st.rerun()
 
-for message in st.session_state.history:
-    if isinstance(message, HumanMessage):
-        with st.chat_message("user"):
-            st.markdown(message.content)
-    elif isinstance(message, AIMessage) and message.content:
-        with st.chat_message("assistant"):
-            st.markdown(message.content)
+    if st.button(
+        "🗑️ Flush memory",
+        help="Supprime toute la mémoire de cet email : faits Mem0 et messages de toutes les sessions.",
+    ):
+        flush_user_id = st.session_state.user_id.strip().lower()
+        if not flush_user_id:
+            st.warning("Renseignez d'abord votre email.")
+        else:
+            try:
+                get_memory_store().flush_user(flush_user_id)
+            except Exception as e:
+                st.error(f"Échec de la suppression de la mémoire : {e}")
+            else:
+                st.session_state.history = []
+                st.session_state.session_id = str(uuid.uuid4())
+                st.session_state.flush_notice = f"Mémoire de {flush_user_id} supprimée."
+                st.rerun()
 
-user_input = st.chat_input("Écrivez votre message...")
+    if "flush_notice" in st.session_state:
+        st.success(st.session_state.pop("flush_notice"))
 
-if user_input:
-    if not st.session_state.user_id.strip():
-        st.warning("Merci de renseigner votre email dans la barre latérale avant de discuter.")
-    else:
-        with st.chat_message("user"):
-            st.markdown(user_input)
-
-        with st.chat_message("assistant"):
-            with st.spinner("L'agent réfléchit..."):
-                reply, updated_history = asyncio.run(
-                    chat(
-                        user_input,
-                        st.session_state.history,
-                        st.session_state.user_id.strip().lower(),
-                        st.session_state.session_id,
-                    )
-                )
-            st.markdown(reply)
-
-        st.session_state.history = updated_history
+pages = [
+    st.Page("views/chat.py", title="Conversation", icon="💬", default=True),
+    st.Page("views/logs.py", title="Logs mémoire & tokens", icon="🔍"),
+]
+st.navigation(pages).run()

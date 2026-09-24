@@ -4,3 +4,4 @@ langchain-core
 mem0ai
 streamlit
 python-dotenv
+tiktoken

@@ -16,6 +16,7 @@ RODIUMAI_EMBEDDING_DIMS = int(os.environ.get("RODIUMAI_EMBEDDING_DIMS", "1536"))
 DATA_DIR = Path(os.environ.get("YOUPI_DATA_DIR", BASE_DIR / "data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-EVENT_STORE_FILE = DATA_DIR / "event_store.json"
+EVENT_DB_FILE = DATA_DIR / "event.db"
+LEGACY_EVENT_STORE_FILE = DATA_DIR / "event_store.json"
 MEM0_STORAGE_DIR = DATA_DIR / "mem0"
 MEM0_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
