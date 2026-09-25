@@ -11,6 +11,7 @@ import re
 from langchain_core.tools import tool
 
 import database
+from rag import get_document_index
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -51,15 +52,6 @@ EVENT_SESSIONS = {
     },
 }
 
-EVENT_FAQ = {
-    "lieu": "L'événement se tient au Centre de Conférences Horizon, 12 rue des Lumières.",
-    "date": "L'événement a lieu le 15 octobre 2026, de 9h à 20h.",
-    "parking": "Un parking gratuit est disponible sur place, entrée par la rue des Lumières.",
-    "restauration": "Le déjeuner et les pauses café sont inclus. Merci de signaler vos restrictions alimentaires lors de l'inscription.",
-    "badge": "Les badges sont à retirer à l'accueil dès 8h avec une pièce d'identité.",
-}
-
-
 @tool
 def register_participant(name: str, email: str, sessions: list[str] | None = None) -> dict:
     """Inscrit un participant à l'événement, et éventuellement à des sessions précises.
@@ -67,7 +59,7 @@ def register_participant(name: str, email: str, sessions: list[str] | None = Non
     Args:
         name: Nom complet du participant.
         email: Adresse email du participant, utilisée comme identifiant unique.
-        sessions: Liste d'identifiants de sessions (voir list_event_sessions) auxquelles
+        sessions: Liste d'identifiants de sessions (parmi : keynote-ouverture, atelier-ia, table-ronde-securite, networking) auxquelles
             inscrire le participant. Optionnel.
     """
     email = email.strip().lower()
@@ -80,7 +72,7 @@ def register_participant(name: str, email: str, sessions: list[str] | None = Non
         return {
             "status": "error",
             "message": f"Session(s) inconnue(s) : {', '.join(unknown)}. "
-            "Utilisez list_event_sessions pour voir les sessions disponibles.",
+            f"Sessions valides : {', '.join(EVENT_SESSIONS)}.",
         }
 
     capacities = {session_id: s["capacity"] for session_id, s in EVENT_SESSIONS.items()}
@@ -146,17 +138,11 @@ def cancel_registration(email: str) -> dict:
 
 
 @tool
-def list_event_sessions() -> dict:
-    """Liste toutes les sessions du programme de l'événement avec horaires et salles."""
-    return {"status": "ok", "sessions": EVENT_SESSIONS}
-
-
-@tool
 def check_session_availability(session_id: str) -> dict:
     """Vérifie le nombre de places restantes pour une session donnée.
 
     Args:
-        session_id: Identifiant de la session (voir list_event_sessions).
+        session_id: Identifiant de la session (parmi : keynote-ouverture, atelier-ia, table-ronde-securite, networking).
     """
     if session_id not in EVENT_SESSIONS:
         return {"status": "error", "message": f"Session inconnue : {session_id}."}
@@ -172,20 +158,24 @@ def check_session_availability(session_id: str) -> dict:
 
 
 @tool
-def get_event_faq(topic: str) -> dict:
-    """Répond aux questions fréquentes sur l'événement (lieu, date, parking, restauration, badge).
+def search_event_documents(query: str) -> dict:
+    """Recherche dans les documents officiels de l'événement (base de connaissances).
+
+    Source de vérité pour TOUT ce qui concerne l'événement : son nom, sa description,
+    les dates, le lieu, le programme, les intervenants, les tarifs, l'accès, le parking,
+    la restauration, le badge, etc. À appeler avant de répondre à toute question sur
+    l'événement, avec une requête précise et autonome.
 
     Args:
-        topic: Le sujet de la question, par exemple 'lieu', 'date', 'parking', 'restauration' ou 'badge'.
+        query: Ce que l'on cherche, formulé en une phrase (ex: "nom et dates de l'événement").
     """
-    key = topic.strip().lower()
-    if key in EVENT_FAQ:
-        return {"status": "ok", "answer": EVENT_FAQ[key]}
-    return {
-        "status": "not_found",
-        "message": f"Pas d'information sur '{topic}'.",
-        "available_topics": list(EVENT_FAQ.keys()),
-    }
+    results = get_document_index().search(query)
+    if not results:
+        return {
+            "status": "not_found",
+            "message": "Aucun document n'est disponible pour l'événement.",
+        }
+    return {"status": "ok", "passages": results}
 
 
 @tool
@@ -205,7 +195,6 @@ BUSINESS_TOOLS = [
     check_registration,
     get_registration,
     cancel_registration,
-    list_event_sessions,
     check_session_availability,
-    get_event_faq,
+    search_event_documents,
 ]
