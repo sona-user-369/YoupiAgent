@@ -1,7 +1,7 @@
 """RAG sur les documents de l'événement (dossier settings_yp.DOCUMENTS_DIR).
 
 Pipeline en deux étages :
-1. Récupération : les documents (.md / .txt / .pdf) sont découpés en passages,
+1. Récupération : les documents (.md / .txt / .pdf / .docx) sont découpés en passages,
    vectorisés avec le modèle d'embedding RodiumAI (API compatible OpenAI) et
    stockés dans Qdrant (mode local sur disque, comme pour Mem0). Une recherche
    vectorielle ramène RETRIEVE_K candidats.
@@ -22,7 +22,7 @@ from qdrant_client import QdrantClient, models
 
 import settings_yp
 
-SUPPORTED_EXTENSIONS = {".md", ".txt", ".pdf"}
+SUPPORTED_EXTENSIONS = {".md", ".txt", ".pdf", ".docx"}
 CHUNK_SIZE = 900  # caractères
 CHUNK_OVERLAP = 150
 EMBED_BATCH = 64
@@ -36,7 +36,36 @@ def _read_document(path) -> str:
         from pypdf import PdfReader
 
         return "\n".join(page.extract_text() or "" for page in PdfReader(str(path)).pages)
+    if path.suffix.lower() == ".docx":
+        return _read_docx(path)
     return path.read_text(encoding="utf-8", errors="ignore")
+
+
+def _read_docx(path) -> str:
+    """Texte d'un .docx, paragraphes et tableaux dans l'ordre du document."""
+    from docx import Document
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    doc = Document(str(path))
+    blocks = []
+    for child in doc.element.body.iterchildren():
+        if child.tag.endswith("}p"):
+            text = Paragraph(child, doc).text.strip()
+            if text:
+                blocks.append(text)
+        elif child.tag.endswith("}tbl"):
+            rows = []
+            for row in Table(child, doc).rows:
+                cells = []
+                for cell in row.cells:
+                    if cell.text.strip() and cell.text.strip() not in cells:  # cellules fusionnées
+                        cells.append(cell.text.strip().replace("\n", " "))
+                if cells:
+                    rows.append(" | ".join(cells))
+            if rows:
+                blocks.append("\n".join(rows))
+    return "\n\n".join(blocks)
 
 
 def _chunk_text(text: str) -> List[str]:

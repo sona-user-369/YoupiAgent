@@ -5,6 +5,7 @@
 
 import json
 import operator
+import uuid
 from datetime import datetime, timezone
 from typing import Annotated, Optional
 
@@ -16,12 +17,14 @@ from rodiumai.integrations.langchain import ChatRodiumAI
 
 import database
 import settings_yp
-from memory import MemoryStore, get_memory_store
+from errors import record_error
+from memory import DEFAULT_MEMORY_TYPE, get_store_for
 from tools import BUSINESS_TOOLS
 
 from langgraph.graph import StateGraph
 
 MAX_TOOL_ITERATIONS = 10
+RAG_TOOL_NAME = "search_event_documents"
 
 # Encodage approximatif pour compter les tokens envoyés au LLM (à titre de
 # diagnostic dans l'écran de logs) : RodiumAI/gpt-4o-mini n'a pas d'encodage
@@ -77,6 +80,16 @@ Style : concis, courtois, en français sauf si le participant écrit dans une au
 {memory_section}"""
 
 
+def _format_history_section(history: list[dict]) -> str:
+    """Section mémoire du mode « classique » : derniers messages injectés tels quels."""
+    if not history:
+        return ""
+    lines = "\n".join(
+        f"{'Participant' if m['role'] == 'user' else 'Assistant'} : {m['content']}" for m in history
+    )
+    return f"Derniers messages des conversations avec ce participant :\n{lines}"
+
+
 def _format_memory_section(memories: list[dict]) -> str:
     if not memories:
         return ""
@@ -95,90 +108,157 @@ def _session_messages_to_langchain(messages: list[dict]) -> list:
     return out
 
 
+def _last_user_text(messages: list) -> str:
+    return next((m.content for m in reversed(messages) if m.type == "human"), "")
+
+
 class State(BaseModel):
     messages: Annotated[list, operator.add] = Field(default_factory=list)
     user_id: str = "anonymous"
     session_id: str = "default"
+    turn_id: Optional[str] = None
+    memory_type: str = DEFAULT_MEMORY_TYPE  # "classic" ou "mem0", fixé au début de la conversation
+    # Contexte préparé par le nœud "prepare", lu par les nœuds suivants.
+    system_prompt: str = ""
+    memories: list = Field(default_factory=list)
+    last_exchange_raw: list = Field(default_factory=list)
 
 
 class YoupiAgent:
-    def __init__(self, memory: Optional[MemoryStore] = None):
+    def __init__(self):
         database.init_db()
         self.llm = RodiumAI(api_key=settings_yp.RODIUMAI_APIKEY)
         self.tools = list(BUSINESS_TOOLS)
         self.tools_by_name = {t.name: t for t in self.tools}
         self.chat_model = ChatRodiumAI(client=self.llm, model=settings_yp.RODIUMAI_MODEL)
-        self.memory = memory or get_memory_store()
+        self.model_with_tools = self.chat_model.bind_tools(self.tools)
 
     async def _run_tool_call(self, tool_call: dict) -> ToolMessage:
         tool_obj = self.tools_by_name.get(tool_call["name"])
         if tool_obj is None:
             content = f"Erreur : outil '{tool_call['name']}' introuvable."
+            record_error(f"tool:{tool_call['name']}", content)
         else:
             try:
                 result = tool_obj.invoke(tool_call["args"])
             except Exception as e:
+                record_error(f"tool:{tool_call['name']}", f"L'outil {tool_call['name']} a échoué", exc=e)
                 result = {"status": "error", "message": str(e)}
             content = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
-        return ToolMessage(content=content, tool_call_id=tool_call["id"])
+        return ToolMessage(content=content, tool_call_id=tool_call["id"], name=tool_call["name"])
 
-    async def call(self, state: State):
+    async def prepare(self, state: State):
+        """Prépare le contexte du tour : souvenirs Mem0 + dernier échange de la session."""
         # On ne reçoit ici que le nouveau message de l'utilisateur : on ne
         # passe jamais tout l'historique brut de la conversation à l'agent.
-        current_turn = list(state.messages)
-
-        last_user_text = next(
-            (m.content for m in reversed(current_turn) if m.type == "human"),
-            "",
-        )
-        relevant_memories = self.memory.search(query=last_user_text, user_id=state.user_id)
-        system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
-            memory_section=_format_memory_section(relevant_memories)
-        )
-
+        last_user_text = _last_user_text(state.messages)
+        memory = get_store_for(state.memory_type)
+        if state.memory_type == "classic":
+            memories, last_exchange_raw = [], []
+            memory_section = _format_history_section(memory.get_history(state.user_id))
+        else:
+            memories = memory.search(query=last_user_text, user_id=state.user_id)
+            last_exchange_raw = memory.get_messages(state.session_id)
+            memory_section = _format_memory_section(memories)
+        system_prompt = SYSTEM_PROMPT_TEMPLATE.format(memory_section=memory_section)
         # Contexte court-terme : uniquement le dernier échange de la session
         # (au-delà, on compte sur Mem0 plutôt que sur l'historique brut).
-        last_exchange_raw = self.memory.get_messages(state.session_id)
+        return {
+            "system_prompt": system_prompt,
+            "memories": memories,
+            "last_exchange_raw": last_exchange_raw,
+        }
+
+    async def agent(self, state: State):
+        """Étape « Reason » : le LLM répond ou demande des outils."""
+        conversation = (
+            [SystemMessage(state.system_prompt)]
+            + _session_messages_to_langchain(state.last_exchange_raw)
+            + state.messages
+        )
+        response = await self.model_with_tools.ainvoke(conversation)
+        return {"messages": [response]}
+
+    async def act(self, state: State):
+        """Étape « Act » : exécute les appels d'outils du dernier message du LLM."""
+        tool_messages = [await self._run_tool_call(tc) for tc in state.messages[-1].tool_calls]
+        return {"messages": tool_messages}
+
+    def route(self, state: State) -> str:
+        """Boucle vers les outils tant que le LLM en demande, dans la limite de MAX_TOOL_ITERATIONS."""
+        llm_calls = sum(isinstance(m, AIMessage) for m in state.messages)
+        if state.messages[-1].tool_calls and llm_calls < MAX_TOOL_ITERATIONS:
+            return "act"
+        return "finalize"
+
+    async def finalize(self, state: State):
+        """Journalise le tour, met à jour les mémoires et renvoie l'état final."""
+        memory = get_store_for(state.memory_type)
+        current_turn = [m for m in state.messages if m.type != "system"]
+        last_user_text = _last_user_text(current_turn)
+        last_exchange_raw = state.last_exchange_raw
         last_exchange = _session_messages_to_langchain(last_exchange_raw)
 
-        conversation = [SystemMessage(system_prompt)] + last_exchange + current_turn
-        model_with_tools = self.chat_model.bind_tools(self.tools)
-
-        turn_start = len(conversation)
-        for _ in range(MAX_TOOL_ITERATIONS):
-            response = await model_with_tools.ainvoke(conversation)
-            conversation.append(response)
-
-            if not response.tool_calls:
-                break
-
-            for tool_call in response.tool_calls:
-                conversation.append(await self._run_tool_call(tool_call))
-
-        new_messages = conversation[turn_start:]
+        tool_counts: dict[str, int] = {}
+        rag_tokens = 0  # tokens des passages RAG renvoyés au LLM pendant ce tour
+        for m in state.messages:
+            if isinstance(m, AIMessage):
+                for tc in m.tool_calls:
+                    tool_counts[tc["name"]] = tool_counts.get(tc["name"], 0) + 1
+            elif isinstance(m, ToolMessage) and m.name == RAG_TOOL_NAME:
+                rag_tokens += _count_tokens(m.content)
 
         final_ai_text = next(
-            (m.content for m in reversed(new_messages) if isinstance(m, AIMessage) and m.content),
+            (m.content for m in reversed(state.messages) if isinstance(m, AIMessage) and m.content),
             "",
         )
 
-        mem0_events = self.memory.remember_exchange(state.user_id, last_user_text, final_ai_text)
-        self.memory.add_message(state.session_id, "user", last_user_text)
-        self.memory.add_message(state.session_id, "assistant", final_ai_text)
+        if not final_ai_text:
+            # Réponse vide : sans trace, l'utilisateur ne voit rien et ne sait pas pourquoi.
+            if state.messages[-1].tool_calls:
+                record_error(
+                    "max_iterations",
+                    f"Aucune réponse : {MAX_TOOL_ITERATIONS} tours d'outils sans réponse finale",
+                    details=f"Outils appelés : {tool_counts}",
+                )
+            else:
+                record_error(
+                    "empty_reply",
+                    "Le LLM a renvoyé une réponse vide",
+                    details=f"Dernier message : {state.messages[-1]!r}\nOutils appelés : {tool_counts}",
+                )
+
+        mem0_events = memory.remember_exchange(
+            state.session_id, state.user_id, last_user_text, final_ai_text
+        )
 
         # Diagnostic pour l'écran de logs : ce qui a réellement été envoyé au
         # LLM pour ce tour (system prompt + dernier échange + message courant),
         # et ce que Mem0 a cherché/retenu.
-        system_tokens = _count_tokens(system_prompt) + _TOKENS_PER_MESSAGE_OVERHEAD
+        first_human = next(i for i, m in enumerate(state.messages) if m.type == "human")
+        system_tokens = _count_tokens(state.system_prompt) + _TOKENS_PER_MESSAGE_OVERHEAD
         short_term_tokens = _count_message_tokens(last_exchange)
-        current_tokens = _count_message_tokens(current_turn)
-        self.memory.log_turn(
+        current_tokens = _count_message_tokens(state.messages[: first_human + 1])
+        turn_id = state.turn_id or str(uuid.uuid4())
+        database.save_turn(
+            turn_id=turn_id,
+            session_id=state.session_id,
+            user_id=state.user_id,
+            user_text=last_user_text,
+            assistant_text=final_ai_text,
+            tokens_sent=system_tokens + short_term_tokens + current_tokens,
+            rag_tokens=rag_tokens,
+            tool_counts=tool_counts,
+            memory_type=state.memory_type,
+        )
+        memory.log_turn(
             state.session_id,
             {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "user_id": state.user_id,
+                "memory_type": state.memory_type,
                 "user_text": last_user_text,
-                "mem0_search": {"query": last_user_text, "results": relevant_memories},
+                "mem0_search": {"query": last_user_text, "results": state.memories},
                 "mem0_events": mem0_events,
                 "short_term_window": last_exchange_raw,
                 "tokens": {
@@ -189,12 +269,18 @@ class YoupiAgent:
                 },
             },
         )
-
-        return {"messages": new_messages}
+        return {"turn_id": turn_id}
 
     def construct(self):
+        """Graphe ReAct : prepare → agent ⇄ act → finalize."""
         g = StateGraph(State)
-        g.add_node("assistant", self.call)
-        g.set_entry_point("assistant")
-        g.set_finish_point("assistant")
+        g.add_node("prepare", self.prepare)
+        g.add_node("agent", self.agent)
+        g.add_node("act", self.act)
+        g.add_node("finalize", self.finalize)
+        g.set_entry_point("prepare")
+        g.add_edge("prepare", "agent")
+        g.add_conditional_edges("agent", self.route, {"act": "act", "finalize": "finalize"})
+        g.add_edge("act", "agent")
+        g.set_finish_point("finalize")
         return g.compile()

@@ -2,7 +2,7 @@
 
 import streamlit as st
 
-from memory import get_memory_store
+from memory import MEMORY_TYPES, get_store_for
 
 st.title("🔍 Logs mémoire & tokens")
 
@@ -14,7 +14,8 @@ st.caption(
     "conversation s'allonge."
 )
 
-logs = get_memory_store().get_logs(st.session_state.session_id)
+st.caption(f"Type de mémoire de cette conversation : **{MEMORY_TYPES[st.session_state.memory_type]}**")
+logs = get_store_for(st.session_state.memory_type).get_logs(st.session_state.session_id)
 
 if not logs:
     st.info("Aucun échange pour l'instant dans cette session.")
@@ -41,10 +42,16 @@ else:
         with st.expander(f"Tour {turn_no} — « {preview} »", expanded=(i == 0)):
             st.markdown(f"**Message utilisateur :** {entry['user_text']}")
 
-            st.markdown("**Recherche Mem0** (`memory.search`, sémantique, filtrée par `user_id`)")
-            st.code(f'query = "{entry["mem0_search"]["query"]}"', language="text")
+            is_classic = entry.get("memory_type") == "classic"
+            if is_classic:
+                st.caption("Mémoire classique : les 30 derniers messages sont injectés dans le system prompt (pas de recherche Mem0).")
+            else:
+                st.markdown("**Recherche Mem0** (`memory.search`, sémantique, filtrée par `user_id`)")
+                st.code(f'query = "{entry["mem0_search"]["query"]}"', language="text")
             results = entry["mem0_search"]["results"]
-            if results:
+            if is_classic:
+                pass
+            elif results:
                 for r in results:
                     score = r.get("score")
                     score_txt = f"  _(score={score:.3f})_" if isinstance(score, (int, float)) else ""
@@ -59,11 +66,15 @@ else:
                     st.markdown(f"- `{e['event']}` — {e['memory']}")
 
             short_term = entry.get("short_term_window") or []
+            if is_classic:
+                short_term = []
             st.markdown("**Fenêtre court-terme utilisée pour ce tour** (dernier échange, avant ce message)")
             if short_term:
                 for m in short_term:
                     role = "utilisateur" if m["role"] == "user" else "assistant"
                     st.markdown(f"- _{role}_ : {m['content']}")
+            elif is_classic:
+                st.caption("Non utilisée : l'historique est dans la section mémoire du system prompt.")
             else:
                 st.caption("Aucun échange précédent dans cette session (premier tour).")
 

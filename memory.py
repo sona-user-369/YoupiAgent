@@ -21,6 +21,7 @@ from typing import Dict, List, Optional
 from mem0 import Memory
 
 import settings_yp
+from errors import record_error
 
 
 def _build_mem0_config() -> dict:
@@ -72,7 +73,7 @@ def _extract_search_entries(result) -> List[Dict]:
 
 
 def _extract_add_events(result) -> List[Dict]:
-    """Évènements Mem0 (ADD/UPDATE/DELETE/NONE) suite à l'ajout d'un échange."""
+    """Évènements Mem0 suite à l'ajout d'un échange (des ADD avec l'algorithme ADD-only)."""
     entries = result.get("results", result) if isinstance(result, dict) else result
     return [
         {"memory": e.get("memory", ""), "event": e.get("event", "")}
@@ -98,28 +99,29 @@ class MemoryStore:
         self._logs: Dict[str, List[Dict]] = {}
         self._memory = Memory.from_config(_build_mem0_config())
 
-    def add_message(self, session_id: str, role: str, content: str) -> None:
-        """Ajoute un message à la fenêtre de session (dernier échange uniquement)."""
-        if not content:
-            return
-        with self._lock:
-            messages = self._sessions.setdefault(session_id, [])
-            messages.append({"role": role, "content": content})
-            del messages[: -self._SESSION_WINDOW]
-
     def get_messages(self, session_id: str) -> List[Dict[str, str]]:
         """Récupère le dernier échange (courte fenêtre) de la session."""
         with self._lock:
             return list(self._sessions.get(session_id, []))
 
-    def remember_exchange(self, user_id: str, user_text: str, assistant_text: str) -> List[Dict]:
-        """Envoie un échange (question/réponse) à Mem0 pour extraction de faits durables.
+    def remember_exchange(
+        self, session_id: str, user_id: str, user_text: str, assistant_text: str
+    ) -> List[Dict]:
+        """Mémorise un échange : fenêtre de session + Mem0 (extraction de faits durables).
 
-        Retourne les évènements Mem0 (faits ajoutés/mis à jour/supprimés), utilisés
-        uniquement pour l'écran de logs.
+        L'algorithme d'ajout de Mem0 est ADD-only : `add` crée toujours de nouveaux
+        faits (plus de décision UPDATE/DELETE à l'extraction) et la résolution
+        temporelle se fait à la recherche. Les méthodes update/delete de Mem0
+        restent disponibles par ailleurs (ex. `delete_all` dans `flush_user`).
+        Retourne les évènements Mem0, utilisés uniquement pour l'écran de logs.
         """
         if not user_text or not assistant_text:
             return []
+        with self._lock:
+            messages = self._sessions.setdefault(session_id, [])
+            messages.append({"role": "user", "content": user_text})
+            messages.append({"role": "assistant", "content": assistant_text})
+            del messages[: -self._SESSION_WINDOW]
         try:
             result = self._memory.add(
                 messages=[
@@ -129,9 +131,10 @@ class MemoryStore:
                 user_id=user_id,
             )
             return _extract_add_events(result)
-        except Exception:
+        except Exception as e:
             # La mémoire long-terme est un "best effort" : une panne ne doit
-            # jamais casser la conversation en cours.
+            # jamais casser la conversation en cours (mais on la consigne).
+            record_error("mem0_add", "Mem0 n'a pas pu mémoriser l'échange", exc=e, level="warning")
             return []
 
     def search(self, query: str, user_id: str, limit: int = 5) -> List[Dict]:
@@ -144,7 +147,8 @@ class MemoryStore:
             return []
         try:
             result = self._memory.search(query=query, filters={"user_id": user_id}, top_k=limit)
-        except Exception:
+        except Exception as e:
+            record_error("mem0_search", "Recherche Mem0 en échec", exc=e, level="warning")
             return []
         return _extract_search_entries(result)
 
@@ -195,3 +199,18 @@ def get_memory_store() -> MemoryStore:
             if _default_store is None:
                 _default_store = MemoryStore()
     return _default_store
+
+
+MEMORY_TYPES = {
+    "classic": "Classique (30 derniers messages injectés)",
+    "mem0": "Mem0 (faits extraits + recherche sémantique)",
+}
+DEFAULT_MEMORY_TYPE = "classic"
+
+
+def get_store_for(memory_type: str):
+    """Retourne le store de mémoire correspondant au type choisi pour la conversation."""
+    if memory_type == "classic":
+        from memory_cache import get_cache_memory_store
+        return get_cache_memory_store()
+    return get_memory_store()

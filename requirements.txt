@@ -9,3 +9,4 @@ pypdf
 qdrant-client
 fastembed
 openai
+python-docx

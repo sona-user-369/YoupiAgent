@@ -55,6 +55,40 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS turns (
+                turn_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                user_text TEXT NOT NULL,
+                assistant_text TEXT NOT NULL,
+                tokens_sent INTEGER NOT NULL DEFAULT 0,
+                rag_tokens INTEGER NOT NULL DEFAULT 0,
+                tool_counts TEXT NOT NULL DEFAULT '{}',
+                label TEXT CHECK (label IN ('correct', 'incorrect'))
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS errors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                session_id TEXT,
+                user_id TEXT,
+                turn_id TEXT,
+                source TEXT NOT NULL,
+                level TEXT NOT NULL DEFAULT 'error',
+                message TEXT NOT NULL,
+                details TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        turn_columns = {row["name"] for row in conn.execute("PRAGMA table_info(turns)")}
+        if "memory_type" not in turn_columns:
+            conn.execute("ALTER TABLE turns ADD COLUMN memory_type TEXT NOT NULL DEFAULT 'mem0'")
     _migrate_legacy_json_store()
 
 
@@ -142,3 +176,108 @@ def count_session_registrations(session_id: str) -> int:
         return conn.execute(
             "SELECT COUNT(*) FROM session_registrations WHERE session_id = ?", (session_id,)
         ).fetchone()[0]
+
+
+# --- Historique des tours (métriques + annotations) -------------------------
+
+def save_turn(
+    turn_id: str,
+    session_id: str,
+    user_id: str,
+    user_text: str,
+    assistant_text: str,
+    tokens_sent: int,
+    rag_tokens: int,
+    tool_counts: Dict[str, int],
+    memory_type: str = "mem0",
+) -> None:
+    with _WRITE_LOCK, _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO turns (turn_id, session_id, user_id, timestamp, user_text,
+                               assistant_text, tokens_sent, rag_tokens, tool_counts, memory_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                turn_id,
+                session_id,
+                user_id,
+                datetime.now(timezone.utc).isoformat(),
+                user_text,
+                assistant_text,
+                tokens_sent,
+                rag_tokens,
+                json.dumps(tool_counts, ensure_ascii=False),
+                memory_type,
+            ),
+        )
+
+
+def get_turns(session_id: Optional[str] = None) -> List[Dict]:
+    """Tours enregistrés (du plus ancien au plus récent), d'une session ou de toutes."""
+    query = "SELECT * FROM turns"
+    params: tuple = ()
+    if session_id is not None:
+        query += " WHERE session_id = ?"
+        params = (session_id,)
+    with _connect() as conn:
+        rows = conn.execute(query + " ORDER BY timestamp", params).fetchall()
+    turns = [dict(r) for r in rows]
+    for t in turns:
+        t["tool_counts"] = json.loads(t["tool_counts"])
+    return turns
+
+
+def set_turn_label(turn_id: str, label: Optional[str]) -> None:
+    """Annote la réponse d'un tour : 'correct', 'incorrect' ou None pour effacer."""
+    with _WRITE_LOCK, _connect() as conn:
+        conn.execute("UPDATE turns SET label = ? WHERE turn_id = ?", (label, turn_id))
+
+
+# --- Journal des erreurs -----------------------------------------------------
+
+def log_error(
+    source: str,
+    level: str,
+    message: str,
+    details: str = "",
+    session_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    turn_id: Optional[str] = None,
+) -> None:
+    with _WRITE_LOCK, _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO errors (timestamp, session_id, user_id, turn_id, source, level, message, details)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                datetime.now(timezone.utc).isoformat(),
+                session_id,
+                user_id,
+                turn_id,
+                source,
+                level,
+                message,
+                details,
+            ),
+        )
+
+
+def get_errors(session_id: Optional[str] = None) -> List[Dict]:
+    """Erreurs enregistrées, de la plus récente à la plus ancienne (session donnée ou toutes)."""
+    query = "SELECT * FROM errors"
+    params: tuple = ()
+    if session_id is not None:
+        query += " WHERE session_id = ?"
+        params = (session_id,)
+    with _connect() as conn:
+        return [dict(r) for r in conn.execute(query + " ORDER BY id DESC", params)]
+
+
+def clear_errors(session_id: Optional[str] = None) -> None:
+    with _WRITE_LOCK, _connect() as conn:
+        if session_id is None:
+            conn.execute("DELETE FROM errors")
+        else:
+            conn.execute("DELETE FROM errors WHERE session_id = ?", (session_id,))
